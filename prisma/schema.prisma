@@ -1,0 +1,68 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String           @id @default(cuid())
+  telegramId      String           @unique
+  username        String?
+  firstName       String?
+  lastName        String?
+  hasAccess       Boolean          @default(false)
+  accessGrantedAt DateTime?
+  channelInvite   String?
+  createdAt       DateTime         @default(now())
+  payments        Payment[]
+  progress        LessonProgress[]
+  unlockRequests  UnlockRequest[]
+}
+
+model Lesson {
+  id        String           @id @default(cuid())
+  number    Int              @unique
+  title     String
+  fileId    String
+  fileName  String
+  mimeType  String?
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  progress  LessonProgress[]
+}
+
+model LessonProgress {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lessonId   String
+  lesson     Lesson   @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  unlockedAt DateTime @default(now())
+
+  @@unique([userId, lessonId])
+}
+
+model UnlockRequest {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lessonNumber Int
+  status       String    @default("pending")
+  createdAt    DateTime  @default(now())
+  resolvedAt   DateTime?
+}
+
+model Payment {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderId       String    @unique
+  amountKopecks Int
+  status        String    @default("pending")
+  provider      String    @default("selfwork")
+  createdAt     DateTime  @default(now())
+  paidAt        DateTime?
+}
