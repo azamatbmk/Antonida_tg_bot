@@ -37,6 +37,19 @@ export class LessonsService {
     return this.prisma.lesson.findUnique({ where: { number } });
   }
 
+  async deleteByNumber(number: number): Promise<Lesson | null> {
+    const lesson = await this.findByNumber(number);
+    if (!lesson) {
+      return null;
+    }
+    await this.prisma.unlockRequest.updateMany({
+      where: { lessonNumber: number, status: 'pending' },
+      data: { status: 'rejected', resolvedAt: new Date() },
+    });
+    await this.prisma.lesson.delete({ where: { id: lesson.id } });
+    return lesson;
+  }
+
   async unlockedLessons(userId: string): Promise<Lesson[]> {
     const rows = await this.prisma.lessonProgress.findMany({
       where: { userId },

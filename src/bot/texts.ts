@@ -70,9 +70,20 @@ export const texts = {
   ownerLessonsEmpty: 'Пока нет файлов. Пришлите урок как файл с номером в начале имени.',
 
   ownerLessons: (lessons: Lesson[]) =>
-    ['Загруженные уроки:', ...lessons.map((lesson) => formatLessonLabel(lesson.number, lesson.title))].join(
-      '\n',
-    ),
+    [
+      'Загруженные уроки.',
+      'Чтобы заменить — пришлите новый файл с тем же номером.',
+      'Чтобы удалить — нажмите кнопку ниже.',
+      '',
+      ...lessons.map((lesson) => formatLessonLabel(lesson.number, lesson.title)),
+    ].join('\n'),
+
+  ownerDeleteConfirm: (label: string) =>
+    `Удалить «${label}»?\nУ учеников этот урок пропадёт из списка. Открытые заявки на него закроются.`,
+
+  ownerDeleted: (label: string) => `Удалил урок: ${label}`,
+
+  ownerDeleteMissing: 'Такого урока уже нет.',
 
   ownerRequestsEmpty: 'Открытых заявок нет.',
 

@@ -17,8 +17,10 @@ import { UsersService } from '../users/users.service';
 import { TELEGRAM_BOT } from './bot.constants';
 import {
   backHomeKeyboard,
+  confirmDeleteLessonKeyboard,
   guestKeyboard,
   ownerKeyboard,
+  ownerLessonsKeyboard,
   studentKeyboard,
 } from './keyboards';
 import { texts } from './texts';
@@ -73,6 +75,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.callbackQuery('admin:lessons', (ctx) => this.onOwnerLessons(ctx));
     this.bot.callbackQuery('admin:requests', (ctx) => this.onOwnerRequests(ctx));
     this.bot.callbackQuery(/^lesson:get:(\d+)$/, (ctx) => this.onGetLesson(ctx));
+    this.bot.callbackQuery(/^lesson:del:(\d+)$/, (ctx) => this.onDeleteLessonAsk(ctx));
+    this.bot.callbackQuery(/^lesson:delok:(\d+)$/, (ctx) => this.onDeleteLessonConfirm(ctx));
     this.bot.callbackQuery(/^unlock:ok:(.+)$/, (ctx) => this.onUnlock(ctx, 'approved'));
     this.bot.callbackQuery(/^unlock:no:(.+)$/, (ctx) => this.onUnlock(ctx, 'rejected'));
 
@@ -215,10 +219,61 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     }
     await ctx.answerCallbackQuery();
     const lessons = await this.lessons.list();
-    await ctx.reply(
-      lessons.length === 0 ? texts.ownerLessonsEmpty : texts.ownerLessons(lessons),
-      { reply_markup: backHomeKeyboard() },
-    );
+    if (lessons.length === 0) {
+      await ctx.reply(texts.ownerLessonsEmpty, { reply_markup: backHomeKeyboard() });
+      return;
+    }
+    await ctx.reply(texts.ownerLessons(lessons), {
+      reply_markup: ownerLessonsKeyboard(lessons),
+    });
+  }
+
+  private async onDeleteLessonAsk(ctx: Context): Promise<void> {
+    const user = await this.actor(ctx);
+    if (!user || !this.ensureOwner(ctx, user.telegramId)) {
+      return;
+    }
+    const number = Number(ctx.match?.[1]);
+    const lesson = Number.isFinite(number)
+      ? await this.lessons.findByNumber(number)
+      : null;
+    if (!lesson) {
+      await ctx.answerCallbackQuery({ text: texts.ownerDeleteMissing });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const label = formatLessonLabel(lesson.number, lesson.title);
+    await ctx.reply(texts.ownerDeleteConfirm(label), {
+      reply_markup: confirmDeleteLessonKeyboard(lesson.number),
+    });
+  }
+
+  private async onDeleteLessonConfirm(ctx: Context): Promise<void> {
+    const user = await this.actor(ctx);
+    if (!user || !this.ensureOwner(ctx, user.telegramId)) {
+      return;
+    }
+    const number = Number(ctx.match?.[1]);
+    if (!Number.isFinite(number)) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    const deleted = await this.lessons.deleteByNumber(number);
+    if (!deleted) {
+      await ctx.answerCallbackQuery({ text: texts.ownerDeleteMissing });
+      return;
+    }
+    const label = formatLessonLabel(deleted.number, deleted.title);
+    await ctx.answerCallbackQuery({ text: 'Удалено' });
+    await ctx.editMessageText(texts.ownerDeleted(label));
+    const lessons = await this.lessons.list();
+    if (lessons.length === 0) {
+      await ctx.reply(texts.ownerLessonsEmpty, { reply_markup: backHomeKeyboard() });
+      return;
+    }
+    await ctx.reply(texts.ownerLessons(lessons), {
+      reply_markup: ownerLessonsKeyboard(lessons),
+    });
   }
 
   private async onOwnerRequests(ctx: Context): Promise<void> {
