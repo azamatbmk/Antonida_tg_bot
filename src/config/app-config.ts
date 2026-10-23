@@ -13,6 +13,26 @@ function optional(config: ConfigService, key: string): string | undefined {
   return value ? value : undefined;
 }
 
+function truthy(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+}
+
+function isLocalPublicUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '127.0.0.1' ||
+      parsed.hostname === '::1'
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function readAppConfig(config: ConfigService) {
   const ownerIds = (config.get<string>('OWNER_TELEGRAM_IDS') ?? '')
     .split(',')
@@ -24,6 +44,15 @@ export function readAppConfig(config: ConfigService) {
     10,
   );
 
+  const selfworkApiKey = optional(config, 'SELFWORK_API_KEY');
+  const callbackSecret = optional(config, 'SELFWORK_CALLBACK_SECRET');
+  const mockPayFlag = truthy(optional(config, 'ENABLE_MOCK_PAY'));
+  const isProd =
+    (optional(config, 'NODE_ENV') ?? process.env.NODE_ENV) === 'production';
+  const publicUrl = (
+    optional(config, 'PUBLIC_URL') ?? 'http://localhost:3000'
+  ).replace(/\/$/, '');
+
   return {
     botToken: required(config, 'BOT_TOKEN'),
     ownerIds,
@@ -31,18 +60,27 @@ export function readAppConfig(config: ConfigService) {
     courseTitle:
       optional(config, 'COURSE_TITLE') ?? 'Начальный курс танцев',
     coursePriceRub: Number.isFinite(priceRub) && priceRub > 0 ? priceRub : 3000,
-    publicUrl: (optional(config, 'PUBLIC_URL') ?? 'http://localhost:3000').replace(
-      /\/$/,
-      '',
-    ),
+    publicUrl,
     port: Number.parseInt(config.get<string>('PORT') ?? '3000', 10) || 3000,
+    /**
+     * Mock pay only when:
+     * - ENABLE_MOCK_PAY=1
+     * - not production
+     * - Selfwork not fully configured
+     * - PUBLIC_URL is localhost (blocks accidental deploy with mock on)
+     */
+    mockPayEnabled:
+      mockPayFlag &&
+      !isProd &&
+      !(selfworkApiKey && callbackSecret) &&
+      isLocalPublicUrl(publicUrl),
     selfwork: {
-      apiKey: optional(config, 'SELFWORK_API_KEY'),
+      apiKey: selfworkApiKey,
       initUrl:
         optional(config, 'SELFWORK_INIT_URL') ??
         'https://pro.selfwork.ru/merchant/v1/init',
       origin: optional(config, 'SELFWORK_ORIGIN'),
-      callbackSecret: optional(config, 'SELFWORK_CALLBACK_SECRET'),
+      callbackSecret,
       siteVerify: optional(config, 'SELFWORK_SITE_VERIFY'),
     },
   };

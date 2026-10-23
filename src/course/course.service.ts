@@ -26,17 +26,25 @@ export class CourseService {
   }
 
   async grantAccess(user: User): Promise<void> {
-    const alreadyHadAccess = user.hasAccess;
-    if (!alreadyHadAccess) {
-      await this.prisma.user.update({
-        where: { id: user.id },
-        data: { hasAccess: true, accessGrantedAt: new Date() },
-      });
+    const claimed = await this.prisma.user.updateMany({
+      where: { id: user.id, hasAccess: false },
+      data: { hasAccess: true, accessGrantedAt: new Date() },
+    });
+    // Another concurrent grant already finished — do not spam lessons
+    if (claimed.count === 0) {
+      return;
     }
 
-    const invite = await this.ensureChannelInvite(user);
-    const lesson = await this.lessons.findByNumber(1);
-    const chatId = Number(user.telegramId);
+    const updated =
+      (await this.prisma.user.findUnique({ where: { id: user.id } })) ?? {
+        ...user,
+        hasAccess: true,
+        accessGrantedAt: new Date(),
+      };
+
+    const invite = await this.ensureChannelInvite(updated);
+    const lesson = await this.lessons.firstLesson();
+    const chatId = Number(updated.telegramId);
 
     const lines = [
       'Оплата прошла. Курс открыт.',
@@ -44,9 +52,9 @@ export class CourseService {
     ];
 
     if (lesson) {
-      await this.lessons.unlock(user.id, lesson.id);
+      await this.lessons.unlock(updated.id, lesson.id);
       await this.bot.api.sendMessage(chatId, lines.filter(Boolean).join('\n'));
-      await this.sendLesson(user, lesson);
+      await this.sendLesson(updated, lesson);
     } else {
       await this.bot.api.sendMessage(
         chatId,
@@ -55,7 +63,7 @@ export class CourseService {
     }
 
     await this.notifyOwners(
-      `Новая оплата: ${this.users.displayName(user)}`,
+      `Новая оплата: ${this.users.displayName(updated)}`,
     );
   }
 
@@ -71,20 +79,21 @@ export class CourseService {
   }
 
   async sendLessonToWaitingStudents(lesson: Lesson): Promise<number> {
-    if (lesson.number !== 1) {
+    const first = await this.lessons.firstLesson();
+    if (!first || first.id !== lesson.id) {
       return 0;
     }
     const waiting = await this.lessons.usersWaitingForLesson(lesson.id);
-    for (const user of waiting) {
+    for (const student of waiting) {
       try {
-        await this.sendLesson(user, lesson);
+        await this.sendLesson(student, lesson);
         await this.bot.api.sendMessage(
-          Number(user.telegramId),
+          Number(student.telegramId),
           'Первый урок готов — отправил его выше.',
         );
       } catch (error) {
         this.logger.warn(
-          `Could not send lesson 1 to ${user.telegramId}: ${String(error)}`,
+          `Could not send first lesson to ${student.telegramId}: ${String(error)}`,
         );
       }
     }
@@ -101,19 +110,18 @@ export class CourseService {
       return { kind: 'none' };
     }
 
-    const existing = await this.lessons.findPendingRequest(user.id, lesson.number);
-    if (existing) {
+    const result = await this.lessons.createRequestSafe(user.id, lesson.number);
+    if (result.kind === 'existing') {
       return { kind: 'pending', lesson };
     }
 
-    const request = await this.lessons.createRequest(user.id, lesson.number);
     const label = formatLessonLabel(lesson.number, lesson.title);
     await this.notifyOwners(
       `Заявка на урок\n\nУченик: ${this.users.displayName(user)}\n${label}`,
       [
         [
-          { text: 'Отправить', callback_data: `unlock:ok:${request.id}` },
-          { text: 'Отклонить', callback_data: `unlock:no:${request.id}` },
+          { text: 'Отправить', callback_data: `unlock:ok:${result.request.id}` },
+          { text: 'Отклонить', callback_data: `unlock:no:${result.request.id}` },
         ],
       ],
     );
@@ -137,7 +145,10 @@ export class CourseService {
       });
       await this.prisma.user.update({
         where: { id: user.id },
-        data: { channelInvite: invite.invite_link },
+        data: {
+          channelInvite: invite.invite_link,
+          channelInviteCreatedAt: new Date(),
+        },
       });
       return invite.invite_link;
     } catch (error) {
@@ -149,12 +160,41 @@ export class CourseService {
     }
   }
 
-  async refreshChannelInvite(user: User): Promise<string | undefined> {
+  /** Returns existing invite only — no new links (prevents sharing/farming). */
+  async getChannelInvite(user: User): Promise<string | undefined> {
+    if (user.channelInvite) {
+      return user.channelInvite;
+    }
+    return this.ensureChannelInvite(user);
+  }
+
+  /**
+   * Owner-only: revoke previous invite and issue a new single-use link.
+   */
+  async rotateChannelInvite(user: User): Promise<string | undefined> {
+    const channelId = readAppConfig(this.config).channelId;
+    if (!channelId) {
+      return undefined;
+    }
+
+    if (user.channelInvite) {
+      try {
+        await this.bot.api.revokeChatInviteLink(channelId, user.channelInvite);
+      } catch (error) {
+        this.logger.warn(`Revoke invite failed: ${String(error)}`);
+      }
+    }
+
     await this.prisma.user.update({
       where: { id: user.id },
-      data: { channelInvite: null },
+      data: { channelInvite: null, channelInviteCreatedAt: null },
     });
-    return this.ensureChannelInvite({ ...user, channelInvite: null });
+
+    return this.ensureChannelInvite({
+      ...user,
+      channelInvite: null,
+      channelInviteCreatedAt: null,
+    });
   }
 
   private async notifyOwners(

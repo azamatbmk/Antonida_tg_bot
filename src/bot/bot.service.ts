@@ -7,7 +7,12 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Bot, Context } from 'grammy';
-import { formatLessonLabel, parseLessonName } from '../common/filename';
+import {
+  formatLessonLabel,
+  isLessonNumber,
+  parseLessonName,
+} from '../common/filename';
+import { takeRateLimit } from '../common/rate-limit';
 import { readAppConfig } from '../config/app-config';
 import { CourseService } from '../course/course.service';
 import { LessonsService } from '../lessons/lessons.service';
@@ -63,6 +68,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   private registerHandlers(): void {
     this.bot.command('start', (ctx) => this.showHome(ctx));
     this.bot.command('admin', (ctx) => this.showOwnerHome(ctx));
+    this.bot.command('reset_invite', (ctx) => this.onResetInvite(ctx));
 
     this.bot.callbackQuery('nav:home', async (ctx) => {
       await ctx.answerCallbackQuery();
@@ -74,9 +80,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.callbackQuery('channel:invite', (ctx) => this.onChannelInvite(ctx));
     this.bot.callbackQuery('admin:lessons', (ctx) => this.onOwnerLessons(ctx));
     this.bot.callbackQuery('admin:requests', (ctx) => this.onOwnerRequests(ctx));
-    this.bot.callbackQuery(/^lesson:get:(\d+)$/, (ctx) => this.onGetLesson(ctx));
-    this.bot.callbackQuery(/^lesson:del:(\d+)$/, (ctx) => this.onDeleteLessonAsk(ctx));
-    this.bot.callbackQuery(/^lesson:delok:(\d+)$/, (ctx) => this.onDeleteLessonConfirm(ctx));
+    this.bot.callbackQuery(/^lesson:get:(\d+(?:\.\d+)*)$/, (ctx) => this.onGetLesson(ctx));
+    this.bot.callbackQuery(/^lesson:del:(\d+(?:\.\d+)*)$/, (ctx) => this.onDeleteLessonAsk(ctx));
+    this.bot.callbackQuery(/^lesson:delok:(\d+(?:\.\d+)*)$/, (ctx) => this.onDeleteLessonConfirm(ctx));
     this.bot.callbackQuery(/^unlock:ok:(.+)$/, (ctx) => this.onUnlock(ctx, 'approved'));
     this.bot.callbackQuery(/^unlock:no:(.+)$/, (ctx) => this.onUnlock(ctx, 'rejected'));
 
@@ -90,14 +96,16 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // Owner gets admin UI only — not the payment/guest flow
     if (this.course.isOwner(user.telegramId)) {
       await ctx.reply(texts.ownerHome, { reply_markup: ownerKeyboard() });
+      return;
     }
 
     const app = readAppConfig(this.config);
     if (!user.hasAccess) {
       await ctx.reply(texts.guestWelcome(app.courseTitle, app.coursePriceRub), {
-        reply_markup: guestKeyboard(!this.selfwork.isConfigured()),
+        reply_markup: guestKeyboard(app.mockPayEnabled),
       });
       return;
     }
@@ -111,6 +119,37 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     await ctx.reply(texts.ownerHome, { reply_markup: ownerKeyboard() });
+  }
+
+  private async onResetInvite(ctx: Context): Promise<void> {
+    const actor = await this.actor(ctx);
+    if (!actor || !this.ensureOwner(ctx, actor.telegramId)) {
+      return;
+    }
+    const raw = ctx.message?.text?.split(/\s+/)[1]?.trim();
+    if (!raw) {
+      await ctx.reply(
+        'Сброс ссылки в канал:\n/reset_invite TELEGRAM_ID\nУченик получит новую одноразовую ссылку.',
+      );
+      return;
+    }
+    const student = await this.users.findByTelegramId(raw);
+    if (!student?.hasAccess) {
+      await ctx.reply('Ученик с доступом не найден.');
+      return;
+    }
+    const link = await this.course.rotateChannelInvite(student);
+    if (!link) {
+      await ctx.reply(texts.noChannel);
+      return;
+    }
+    await this.bot.api.sendMessage(
+      Number(student.telegramId),
+      `Новая ссылка в канал (старая отозвана):\n${link}`,
+    );
+    await ctx.reply(
+      `Новая ссылка для ${this.users.displayName(student)} отправлена ученику.`,
+    );
   }
 
   private async replyStudentHome(ctx: Context, userId: string): Promise<void> {
@@ -129,6 +168,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     if (!user) {
       return;
     }
+    if (this.course.isOwner(user.telegramId)) {
+      await ctx.answerCallbackQuery({ text: 'Для преподавателя оплата не нужна' });
+      return;
+    }
     await ctx.answerCallbackQuery();
     if (user.hasAccess) {
       await ctx.reply(texts.alreadyPaid);
@@ -136,10 +179,20 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    if (!takeRateLimit(`pay:${user.telegramId}`, 5, 60_000)) {
+      await ctx.reply('Слишком много попыток. Подождите минуту.');
+      return;
+    }
+
+    const app = readAppConfig(this.config);
     if (!this.selfwork.isConfigured()) {
-      await ctx.reply(texts.testPayHint, {
-        reply_markup: guestKeyboard(true),
-      });
+      if (app.mockPayEnabled) {
+        await ctx.reply(texts.testPayHint, {
+          reply_markup: guestKeyboard(true),
+        });
+        return;
+      }
+      await ctx.reply('Оплата временно недоступна. Напишите преподавателю.');
       return;
     }
 
@@ -152,8 +205,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     if (!user) {
       return;
     }
-    if (this.selfwork.isConfigured()) {
+    const app = readAppConfig(this.config);
+    if (!app.mockPayEnabled || this.course.isOwner(user.telegramId)) {
       await ctx.answerCallbackQuery({ text: 'Тестовая оплата выключена' });
+      return;
+    }
+    if (!takeRateLimit(`mockpay:${user.telegramId}`, 3, 60_000)) {
+      await ctx.answerCallbackQuery({ text: 'Подождите минуту' });
       return;
     }
     await ctx.answerCallbackQuery({ text: 'Оплата засчитана' });
@@ -162,7 +220,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const payment = await this.payments.createInvoice(user);
-    await this.payments.fulfill(payment.orderId);
+    await this.payments.fulfill(payment.orderId, { skipAmountCheck: true });
   }
 
   private async onNextLesson(ctx: Context): Promise<void> {
@@ -187,8 +245,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
   private async onGetLesson(ctx: Context): Promise<void> {
     const user = await this.actor(ctx);
-    const number = Number(ctx.match?.[1]);
-    if (!user?.hasAccess || !Number.isFinite(number)) {
+    const number = ctx.match?.[1];
+    if (!user?.hasAccess || !number || !isLessonNumber(number)) {
       await ctx.answerCallbackQuery();
       return;
     }
@@ -207,9 +265,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.answerCallbackQuery();
       return;
     }
-    const link = await this.course.refreshChannelInvite(user);
+    if (!takeRateLimit(`invite:${user.telegramId}`, 10, 60_000)) {
+      await ctx.answerCallbackQuery({ text: 'Подождите минуту' });
+      return;
+    }
+    const link = await this.course.getChannelInvite(user);
     await ctx.answerCallbackQuery();
-    await ctx.reply(link ?? texts.noChannel);
+    await ctx.reply(
+      link
+        ? `${link}\n\nСсылка одноразовая. Если уже использовали — напишите преподавателю.`
+        : texts.noChannel,
+    );
   }
 
   private async onOwnerLessons(ctx: Context): Promise<void> {
@@ -233,10 +299,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     if (!user || !this.ensureOwner(ctx, user.telegramId)) {
       return;
     }
-    const number = Number(ctx.match?.[1]);
-    const lesson = Number.isFinite(number)
-      ? await this.lessons.findByNumber(number)
-      : null;
+    const number = ctx.match?.[1];
+    const lesson =
+      number && isLessonNumber(number)
+        ? await this.lessons.findByNumber(number)
+        : null;
     if (!lesson) {
       await ctx.answerCallbackQuery({ text: texts.ownerDeleteMissing });
       return;
@@ -253,8 +320,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     if (!user || !this.ensureOwner(ctx, user.telegramId)) {
       return;
     }
-    const number = Number(ctx.match?.[1]);
-    if (!Number.isFinite(number)) {
+    const number = ctx.match?.[1];
+    if (!number || !isLessonNumber(number)) {
       await ctx.answerCallbackQuery();
       return;
     }
@@ -313,25 +380,34 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.answerCallbackQuery();
       return;
     }
-    const request = await this.lessons.findRequest(requestId);
-    if (!request || request.status !== 'pending') {
+
+    const pending = await this.lessons.findRequest(requestId);
+    if (!pending || pending.status !== 'pending') {
       await ctx.answerCallbackQuery({ text: texts.requestGone });
       return;
     }
 
-    const lesson = await this.lessons.findByNumber(request.lessonNumber);
+    const lesson = await this.lessons.findByNumber(pending.lessonNumber);
+    if (status === 'approved' && !lesson) {
+      await ctx.answerCallbackQuery({
+        text: texts.lessonMissing(pending.lessonNumber),
+      });
+      return;
+    }
+
+    const request = await this.lessons.claimPendingRequest(requestId, status);
+    if (!request) {
+      await ctx.answerCallbackQuery({ text: texts.requestGone });
+      return;
+    }
+
     const label = lesson
       ? formatLessonLabel(lesson.number, lesson.title)
       : `урок ${request.lessonNumber}`;
     const who = this.users.displayName(request.user);
 
-    if (status === 'approved') {
-      if (!lesson) {
-        await ctx.answerCallbackQuery({ text: texts.lessonMissing(request.lessonNumber) });
-        return;
-      }
+    if (status === 'approved' && lesson) {
       await this.course.sendLesson(request.user, lesson);
-      await this.lessons.resolveRequest(request.id, 'approved');
       await this.bot.api.sendMessage(
         Number(request.user.telegramId),
         texts.studentApproved(label),
@@ -341,7 +417,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    await this.lessons.resolveRequest(request.id, 'rejected');
     await this.bot.api.sendMessage(
       Number(request.user.telegramId),
       texts.studentRejected(label),

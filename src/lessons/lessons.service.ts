@@ -1,9 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { Lesson, LessonProgress, UnlockRequest, User } from '@prisma/client';
+import { compareLessonNumbers } from '../common/filename';
 import { PrismaService } from '../prisma/prisma.service';
 
 export type LessonFileInput = {
-  number: number;
+  number: string;
   title: string;
   fileId: string;
   fileName: string;
@@ -29,22 +30,28 @@ export class LessonsService {
     });
   }
 
-  list(): Promise<Lesson[]> {
-    return this.prisma.lesson.findMany({ orderBy: { number: 'asc' } });
+  async list(): Promise<Lesson[]> {
+    const lessons = await this.prisma.lesson.findMany();
+    return lessons.sort((a, b) => compareLessonNumbers(a.number, b.number));
   }
 
-  findByNumber(number: number): Promise<Lesson | null> {
+  findByNumber(number: string): Promise<Lesson | null> {
     return this.prisma.lesson.findUnique({ where: { number } });
   }
 
-  async deleteByNumber(number: number): Promise<Lesson | null> {
+  async firstLesson(): Promise<Lesson | null> {
+    const lessons = await this.list();
+    return lessons[0] ?? null;
+  }
+
+  async deleteByNumber(number: string): Promise<Lesson | null> {
     const lesson = await this.findByNumber(number);
     if (!lesson) {
       return null;
     }
     await this.prisma.unlockRequest.updateMany({
       where: { lessonNumber: number, status: 'pending' },
-      data: { status: 'rejected', resolvedAt: new Date() },
+      data: { status: 'rejected', resolvedAt: new Date(), pendingKey: null },
     });
     await this.prisma.lesson.delete({ where: { id: lesson.id } });
     return lesson;
@@ -55,7 +62,9 @@ export class LessonsService {
       where: { userId },
       include: { lesson: true },
     });
-    return rows.map((row) => row.lesson).sort((a, b) => a.number - b.number);
+    return rows
+      .map((row) => row.lesson)
+      .sort((a, b) => compareLessonNumbers(a.number, b.number));
   }
 
   isUnlocked(userId: string, lessonId: string): Promise<LessonProgress | null> {
@@ -82,17 +91,76 @@ export class LessonsService {
 
   findPendingRequest(
     userId: string,
-    lessonNumber: number,
+    lessonNumber: string,
   ): Promise<UnlockRequest | null> {
     return this.prisma.unlockRequest.findFirst({
       where: { userId, lessonNumber, status: 'pending' },
     });
   }
 
-  createRequest(userId: string, lessonNumber: number): Promise<UnlockRequest> {
-    return this.prisma.unlockRequest.create({
-      data: { userId, lessonNumber },
+  async createRequestSafe(
+    userId: string,
+    lessonNumber: string,
+  ): Promise<
+    | { kind: 'created'; request: UnlockRequest }
+    | { kind: 'existing'; request: UnlockRequest }
+  > {
+    const pendingKey = `${userId}:${lessonNumber}`;
+    const existing = await this.findPendingRequest(userId, lessonNumber);
+    if (existing) {
+      return { kind: 'existing', request: existing };
+    }
+
+    try {
+      const request = await this.prisma.unlockRequest.create({
+        data: {
+          userId,
+          lessonNumber,
+          pendingKey,
+          status: 'pending',
+        },
+      });
+      return { kind: 'created', request };
+    } catch {
+      const raced = await this.findPendingRequest(userId, lessonNumber);
+      if (raced) {
+        return { kind: 'existing', request: raced };
+      }
+      throw new Error('Could not create unlock request');
+    }
+  }
+
+  resolveRequest(
+    id: string,
+    status: 'approved' | 'rejected',
+  ): Promise<UnlockRequest> {
+    return this.prisma.unlockRequest.update({
+      where: { id },
+      data: {
+        status,
+        resolvedAt: new Date(),
+        pendingKey: null,
+      },
     });
+  }
+
+  /** Atomically claim a pending request; returns null if already resolved. */
+  async claimPendingRequest(
+    id: string,
+    status: 'approved' | 'rejected',
+  ): Promise<UnlockRequestWithUser | null> {
+    const claimed = await this.prisma.unlockRequest.updateMany({
+      where: { id, status: 'pending' },
+      data: {
+        status,
+        resolvedAt: new Date(),
+        pendingKey: null,
+      },
+    });
+    if (claimed.count === 0) {
+      return null;
+    }
+    return this.findRequest(id);
   }
 
   findRequest(id: string): Promise<UnlockRequestWithUser | null> {
@@ -107,16 +175,6 @@ export class LessonsService {
       where: { status: 'pending' },
       include: { user: true },
       orderBy: { createdAt: 'asc' },
-    });
-  }
-
-  resolveRequest(
-    id: string,
-    status: 'approved' | 'rejected',
-  ): Promise<UnlockRequest> {
-    return this.prisma.unlockRequest.update({
-      where: { id },
-      data: { status, resolvedAt: new Date() },
     });
   }
 

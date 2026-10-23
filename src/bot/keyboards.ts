@@ -48,7 +48,7 @@ export function ownerLessonsKeyboard(lessons: Lesson[]): InlineKeyboard {
   return keyboard;
 }
 
-export function confirmDeleteLessonKeyboard(number: number): InlineKeyboard {
+export function confirmDeleteLessonKeyboard(number: string): InlineKeyboard {
   return new InlineKeyboard()
     .text('Да, удалить', `lesson:delok:${number}`)
     .text('Отмена', 'admin:lessons');

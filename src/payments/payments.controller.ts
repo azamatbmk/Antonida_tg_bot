@@ -1,6 +1,8 @@
 import {
+  BadRequestException,
   Body,
   Controller,
+  ForbiddenException,
   Get,
   Header,
   HttpCode,
@@ -8,11 +10,12 @@ import {
   Param,
   Post,
   Query,
-  Res,
+  Req,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { Response } from 'express';
+import type { Request } from 'express';
 import { escapeHtml, page } from '../common/html';
+import { takeRateLimit } from '../common/rate-limit';
 import { readAppConfig } from '../config/app-config';
 import { PaymentsService } from './payments.service';
 import { SelfworkService } from './selfwork.service';
@@ -52,7 +55,15 @@ export class PaymentsController {
 
   @Get('pay/:orderId')
   @Header('Content-Type', 'text/html; charset=utf-8')
-  async payPage(@Param('orderId') orderId: string): Promise<string> {
+  async payPage(
+    @Param('orderId') orderId: string,
+    @Req() req: Request,
+  ): Promise<string> {
+    const ip = req.ip ?? 'unknown';
+    if (!takeRateLimit(`pay-page:${ip}`, 30, 60_000)) {
+      throw new ForbiddenException('Too many requests');
+    }
+
     const payment = await this.payments.findByOrderId(orderId);
     if (!payment) {
       throw new NotFoundException();
@@ -64,9 +75,9 @@ export class PaymentsController {
     const app = readAppConfig(this.config);
     if (!this.selfwork.isConfigured()) {
       return page(
-        'Тестовая оплата',
-        `<h1>Тестовый режим</h1>
-         <p>Эквайринг самозанятые.рф ещё не подключен. Засчитайте оплату кнопкой в боте.</p>`,
+        'Оплата недоступна',
+        `<h1>Оплата недоступна</h1>
+         <p>Эквайринг ещё не настроен. Вернитесь в Telegram-бота.</p>`,
       );
     }
 
@@ -96,26 +107,30 @@ export class PaymentsController {
   async callback(
     @Body() body: Record<string, unknown>,
     @Query() query: Record<string, string>,
+    @Req() req: Request,
   ): Promise<string> {
-    const payload = { ...query, ...body };
-    const { callbackSecret } = readAppConfig(this.config).selfwork;
-    if (callbackSecret && payload.token !== callbackSecret && query.token !== callbackSecret) {
-      return 'forbidden';
+    const ip = req.ip ?? 'unknown';
+    if (!takeRateLimit(`pay-cb:${ip}`, 60, 60_000)) {
+      throw new ForbiddenException('Too many requests');
     }
-    const orderId = this.selfwork.verifyCallback(payload);
-    if (!orderId) {
-      return 'ignored';
-    }
-    await this.payments.fulfill(orderId);
-    return 'ok';
-  }
 
-  @Get('payments/selfwork/callback')
-  async callbackGet(
-    @Query() query: Record<string, string>,
-    @Res() res: Response,
-  ): Promise<void> {
-    const result = await this.callback(query, query);
-    res.status(200).send(result);
+    // Body wins over query for token — avoids relying on secret only in URL
+    const payload = { ...query, ...body };
+    const verified = this.selfwork.verifyCallback(payload);
+    if (!verified) {
+      throw new ForbiddenException('Invalid callback');
+    }
+
+    const result = await this.payments.fulfill(verified.orderId, {
+      amountKopecks: verified.amountKopecks,
+    });
+
+    if (result === 'granted' || result === 'already_paid') {
+      return 'ok';
+    }
+    if (result === 'not_found') {
+      throw new NotFoundException('Order not found');
+    }
+    throw new BadRequestException('Amount mismatch');
   }
 }

@@ -8,23 +8,24 @@ datasource db {
 }
 
 model User {
-  id              String           @id @default(cuid())
-  telegramId      String           @unique
-  username        String?
-  firstName       String?
-  lastName        String?
-  hasAccess       Boolean          @default(false)
-  accessGrantedAt DateTime?
-  channelInvite   String?
-  createdAt       DateTime         @default(now())
-  payments        Payment[]
-  progress        LessonProgress[]
-  unlockRequests  UnlockRequest[]
+  id                     String           @id @default(cuid())
+  telegramId             String           @unique
+  username               String?
+  firstName              String?
+  lastName               String?
+  hasAccess              Boolean          @default(false)
+  accessGrantedAt        DateTime?
+  channelInvite          String?
+  channelInviteCreatedAt DateTime?
+  createdAt              DateTime         @default(now())
+  payments               Payment[]
+  progress               LessonProgress[]
+  unlockRequests         UnlockRequest[]
 }
 
 model Lesson {
   id        String           @id @default(cuid())
-  number    Int              @unique
+  number    String           @unique
   title     String
   fileId    String
   fileName  String
@@ -49,8 +50,10 @@ model UnlockRequest {
   id           String    @id @default(cuid())
   userId       String
   user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  lessonNumber Int
+  lessonNumber String
   status       String    @default("pending")
+  /// Set only while status=pending to prevent duplicate requests
+  pendingKey   String?   @unique
   createdAt    DateTime  @default(now())
   resolvedAt   DateTime?
 }
