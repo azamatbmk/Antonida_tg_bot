@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Bot, Context } from 'grammy';
+import { answersMatch } from '../common/answer';
 import {
   formatLessonLabel,
   isLessonNumber,
@@ -30,9 +31,16 @@ import {
   suggestLessonNumberKeyboard,
 } from './keyboards';
 import {
+  clearAllOwnerSessions,
+  clearPendingQuestions,
+  clearPendingQuiz,
   clearPendingUpload,
+  getPendingQuestions,
+  getPendingQuiz,
   getPendingUpload,
   nextLessonNumber,
+  setPendingQuestions,
+  setPendingQuiz,
   setPendingUpload,
 } from './pending-upload';
 import { texts } from './texts';
@@ -76,7 +84,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.command('start', (ctx) => this.showHome(ctx));
     this.bot.command('admin', (ctx) => this.showOwnerHome(ctx));
     this.bot.command('reset_invite', (ctx) => this.onResetInvite(ctx));
-    this.bot.command('cancel', (ctx) => this.onCancelUpload(ctx));
+    this.bot.command('cancel', (ctx) => this.onCancelSession(ctx));
+    this.bot.command('done', (ctx) => this.onOwnerQuestionsDone(ctx));
 
     this.bot.callbackQuery('nav:home', async (ctx) => {
       await ctx.answerCallbackQuery();
@@ -94,11 +103,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.callbackQuery(/^unlock:ok:(.+)$/, (ctx) => this.onUnlock(ctx, 'approved'));
     this.bot.callbackQuery(/^unlock:no:(.+)$/, (ctx) => this.onUnlock(ctx, 'rejected'));
     this.bot.callbackQuery(/^upload:num:(\d+(?:\.\d+)*)$/, (ctx) => this.onUploadPickNumber(ctx));
-    this.bot.callbackQuery('upload:cancel', (ctx) => this.onCancelUpload(ctx));
+    this.bot.callbackQuery('upload:cancel', (ctx) => this.onCancelSession(ctx));
 
     this.bot.on('message:document', (ctx) => this.onOwnerFile(ctx));
     this.bot.on('message:video', (ctx) => this.onOwnerFile(ctx));
-    this.bot.on('message:text', (ctx) => this.onOwnerText(ctx));
+    this.bot.on('message:text', (ctx) => this.onTextMessage(ctx));
   }
 
   private async showHome(ctx: Context): Promise<void> {
@@ -240,9 +249,36 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.answerCallbackQuery();
       return;
     }
+    if (getPendingQuiz(user.telegramId)) {
+      await ctx.answerCallbackQuery({ text: 'Сначала закончите опрос' });
+      return;
+    }
     const result = await this.course.requestNextLesson(user);
     if (result.kind === 'none') {
       await ctx.answerCallbackQuery({ text: texts.allLessonsOpen });
+      return;
+    }
+    if (result.kind === 'quiz') {
+      const questions = await this.lessons.listQuestions(result.current.id);
+      setPendingQuiz(user.telegramId, {
+        currentLessonId: result.current.id,
+        nextLessonId: result.next.id,
+        nextLabel: formatLessonLabel(result.next.number, result.next.title),
+        index: 0,
+        questions: questions.map((q) => ({
+          question: q.question,
+          answer: q.answer,
+        })),
+      });
+      await ctx.answerCallbackQuery();
+      const currentLabel = formatLessonLabel(
+        result.current.number,
+        result.current.title,
+      );
+      await ctx.reply(texts.quizStart(currentLabel, questions.length));
+      await ctx.reply(
+        texts.quizQuestion(1, questions.length, questions[0].question),
+      );
       return;
     }
     const label = formatLessonLabel(result.lesson.number, result.lesson.title);
@@ -464,7 +500,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       parseLessonName(document?.file_name ?? '');
 
     if (parsed) {
-      await this.saveOwnerLesson(ctx, {
+      await this.saveOwnerLesson(ctx, user.telegramId, {
         number: parsed.number,
         title: parsed.title,
         fileId,
@@ -482,22 +518,42 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async onOwnerText(ctx: Context): Promise<void> {
+  private async onTextMessage(ctx: Context): Promise<void> {
     if (ctx.chat?.type !== 'private' || ctx.message?.text?.startsWith('/')) {
       return;
     }
     const user = await this.actor(ctx);
-    if (!user || !this.course.isOwner(user.telegramId)) {
+    if (!user) {
       return;
     }
-
-    const pending = getPendingUpload(user.telegramId);
-    if (!pending) {
-      return;
-    }
-
     const text = ctx.message?.text?.trim() ?? '';
     if (!text) {
+      return;
+    }
+
+    if (this.course.isOwner(user.telegramId)) {
+      if (getPendingQuestions(user.telegramId)) {
+        await this.onOwnerQuestionText(ctx, user.telegramId, text);
+        return;
+      }
+      if (getPendingUpload(user.telegramId)) {
+        await this.onOwnerUploadText(ctx, user.telegramId, text);
+      }
+      return;
+    }
+
+    if (user.hasAccess && getPendingQuiz(user.telegramId)) {
+      await this.onStudentQuizText(ctx, user, text);
+    }
+  }
+
+  private async onOwnerUploadText(
+    ctx: Context,
+    telegramId: string,
+    text: string,
+  ): Promise<void> {
+    const pending = getPendingUpload(telegramId);
+    if (!pending) {
       return;
     }
 
@@ -507,8 +563,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         await ctx.reply(texts.ownerAskTitle(pending.number));
         return;
       }
-      clearPendingUpload(user.telegramId);
-      await this.saveOwnerLesson(ctx, {
+      clearPendingUpload(telegramId);
+      await this.saveOwnerLesson(ctx, telegramId, {
         number: pending.number,
         title,
         fileId: pending.fileId,
@@ -528,14 +584,123 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    clearPendingUpload(user.telegramId);
-    await this.saveOwnerLesson(ctx, {
+    clearPendingUpload(telegramId);
+    await this.saveOwnerLesson(ctx, telegramId, {
       number: parsed.number,
       title: parsed.title,
       fileId: pending.fileId,
       fileName: pending.fileName,
       mimeType: pending.mimeType,
     });
+  }
+
+  private async onOwnerQuestionText(
+    ctx: Context,
+    telegramId: string,
+    text: string,
+  ): Promise<void> {
+    const session = getPendingQuestions(telegramId);
+    if (!session) {
+      return;
+    }
+
+    if (session.step === 'question') {
+      setPendingQuestions(telegramId, {
+        ...session,
+        step: 'answer',
+        draftQuestion: text,
+      });
+      await ctx.reply(texts.ownerAskAnswer(session.items.length + 1));
+      return;
+    }
+
+    const question = session.draftQuestion?.trim() ?? '';
+    if (!question) {
+      setPendingQuestions(telegramId, {
+        ...session,
+        step: 'question',
+        draftQuestion: undefined,
+      });
+      await ctx.reply(texts.ownerAskQuestion(session.items.length + 1));
+      return;
+    }
+
+    const items = [...session.items, { question, answer: text }];
+    setPendingQuestions(telegramId, {
+      ...session,
+      step: 'question',
+      draftQuestion: undefined,
+      items,
+    });
+    await ctx.reply(texts.ownerAskQuestion(items.length + 1));
+  }
+
+  private async onOwnerQuestionsDone(ctx: Context): Promise<void> {
+    const user = await this.actor(ctx);
+    if (!user || !this.ensureOwner(ctx, user.telegramId)) {
+      return;
+    }
+    const session = getPendingQuestions(user.telegramId);
+    if (!session) {
+      await ctx.reply('Сейчас нет незавершённых вопросов. Сначала загрузите урок.');
+      return;
+    }
+    if (session.step === 'answer') {
+      await ctx.reply(
+        'Сначала пришлите ответ на текущий вопрос или /cancel.',
+      );
+      return;
+    }
+    await this.lessons.replaceQuestions(session.lessonId, session.items);
+    clearPendingQuestions(user.telegramId);
+    await ctx.reply(
+      texts.ownerQuestionsSaved(session.lessonLabel, session.items.length),
+    );
+  }
+
+  private async onStudentQuizText(
+    ctx: Context,
+    user: { id: string; telegramId: string },
+    text: string,
+  ): Promise<void> {
+    const quiz = getPendingQuiz(user.telegramId);
+    if (!quiz) {
+      return;
+    }
+    const current = quiz.questions[quiz.index];
+    if (!current) {
+      clearPendingQuiz(user.telegramId);
+      await ctx.reply(texts.quizExpired);
+      return;
+    }
+    if (!answersMatch(current.answer, text)) {
+      await ctx.reply(texts.quizWrong);
+      return;
+    }
+
+    const nextIndex = quiz.index + 1;
+    if (nextIndex < quiz.questions.length) {
+      setPendingQuiz(user.telegramId, { ...quiz, index: nextIndex });
+      await ctx.reply(
+        texts.quizQuestion(
+          nextIndex + 1,
+          quiz.questions.length,
+          quiz.questions[nextIndex].question,
+        ),
+      );
+      return;
+    }
+
+    clearPendingQuiz(user.telegramId);
+    const lesson = await this.lessons.findById(quiz.nextLessonId);
+    const dbUser = await this.users.findById(user.id);
+    if (!lesson || !dbUser) {
+      await ctx.reply('Следующий урок не найден. Напишите преподавателю.');
+      return;
+    }
+    await ctx.reply(texts.quizDone(quiz.nextLabel));
+    await this.course.sendLesson(dbUser, lesson);
+    await this.replyStudentHome(ctx, user.id);
   }
 
   private async onUploadPickNumber(ctx: Context): Promise<void> {
@@ -556,23 +721,41 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     await ctx.reply(texts.ownerAskTitle(number));
   }
 
-  private async onCancelUpload(ctx: Context): Promise<void> {
+  private async onCancelSession(ctx: Context): Promise<void> {
     const user = await this.actor(ctx);
-    if (!user || !this.course.isOwner(user.telegramId)) {
+    if (!user) {
       if (ctx.callbackQuery) {
         await ctx.answerCallbackQuery();
       }
       return;
     }
-    clearPendingUpload(user.telegramId);
-    if (ctx.callbackQuery) {
-      await ctx.answerCallbackQuery({ text: 'Отменено' });
+
+    if (this.course.isOwner(user.telegramId)) {
+      clearAllOwnerSessions(user.telegramId);
+      if (ctx.callbackQuery) {
+        await ctx.answerCallbackQuery({ text: 'Отменено' });
+      }
+      await ctx.reply(texts.ownerUploadCancelled);
+      return;
     }
-    await ctx.reply(texts.ownerUploadCancelled);
+
+    if (getPendingQuiz(user.telegramId)) {
+      clearPendingQuiz(user.telegramId);
+      if (ctx.callbackQuery) {
+        await ctx.answerCallbackQuery({ text: 'Отменено' });
+      }
+      await ctx.reply(texts.quizCancelled);
+      return;
+    }
+
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery();
+    }
   }
 
   private async saveOwnerLesson(
     ctx: Context,
+    telegramId: string,
     input: {
       number: string;
       title: string;
@@ -589,18 +772,23 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       fileName: input.fileName,
       mimeType: input.mimeType,
     });
-    await ctx.reply(
-      texts.ownerSaved(
-        formatLessonLabel(lesson.number, lesson.title),
-        Boolean(existing),
-      ),
-    );
+    const label = formatLessonLabel(lesson.number, lesson.title);
+    await ctx.reply(texts.ownerSaved(label, Boolean(existing)));
     const delivered = await this.course.sendLessonToWaitingStudents(lesson);
     if (delivered > 0) {
       await ctx.reply(
         `Первый урок ушёл ${delivered} ученикам, которые уже оплатили.`,
       );
     }
+
+    await this.lessons.replaceQuestions(lesson.id, []);
+    setPendingQuestions(telegramId, {
+      lessonId: lesson.id,
+      lessonLabel: label,
+      step: 'question',
+      items: [],
+    });
+    await ctx.reply(texts.ownerAskQuestion(1));
   }
 
   private async actor(ctx: Context) {

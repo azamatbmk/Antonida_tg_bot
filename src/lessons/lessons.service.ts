@@ -1,5 +1,12 @@
 import { Injectable } from '@nestjs/common';
-import { Lesson, LessonProgress, UnlockRequest, User } from '@prisma/client';
+import {
+  Lesson,
+  LessonProgress,
+  LessonQuestion,
+  UnlockRequest,
+  User,
+} from '@prisma/client';
+import { normalizeAnswer } from '../common/answer';
 import { compareLessonNumbers } from '../common/filename';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -10,6 +17,8 @@ export type LessonFileInput = {
   fileName: string;
   mimeType?: string;
 };
+
+export type QuestionInput = { question: string; answer: string };
 
 export type UnlockRequestWithUser = UnlockRequest & { user: User };
 
@@ -39,6 +48,10 @@ export class LessonsService {
     return this.prisma.lesson.findUnique({ where: { number } });
   }
 
+  findById(id: string): Promise<Lesson | null> {
+    return this.prisma.lesson.findUnique({ where: { id } });
+  }
+
   async firstLesson(): Promise<Lesson | null> {
     const lessons = await this.list();
     return lessons[0] ?? null;
@@ -65,6 +78,37 @@ export class LessonsService {
     return rows
       .map((row) => row.lesson)
       .sort((a, b) => compareLessonNumbers(a.number, b.number));
+  }
+
+  async lastUnlockedLesson(userId: string): Promise<Lesson | null> {
+    const unlocked = await this.unlockedLessons(userId);
+    return unlocked[unlocked.length - 1] ?? null;
+  }
+
+  listQuestions(lessonId: string): Promise<LessonQuestion[]> {
+    return this.prisma.lessonQuestion.findMany({
+      where: { lessonId },
+      orderBy: { sortOrder: 'asc' },
+    });
+  }
+
+  async replaceQuestions(
+    lessonId: string,
+    items: QuestionInput[],
+  ): Promise<void> {
+    await this.prisma.$transaction([
+      this.prisma.lessonQuestion.deleteMany({ where: { lessonId } }),
+      ...items.map((item, index) =>
+        this.prisma.lessonQuestion.create({
+          data: {
+            lessonId,
+            sortOrder: index + 1,
+            question: item.question.trim(),
+            answer: normalizeAnswer(item.answer),
+          },
+        }),
+      ),
+    ]);
   }
 
   isUnlocked(userId: string, lessonId: string): Promise<LessonProgress | null> {

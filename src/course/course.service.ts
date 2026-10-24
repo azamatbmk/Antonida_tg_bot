@@ -102,22 +102,31 @@ export class CourseService {
 
   async requestNextLesson(user: User): Promise<
     | { kind: 'none' }
+    | { kind: 'quiz'; current: Lesson; next: Lesson }
     | { kind: 'pending'; lesson: Lesson }
     | { kind: 'created'; lesson: Lesson }
   > {
-    const lesson = await this.lessons.nextLockedLesson(user.id);
-    if (!lesson) {
+    const next = await this.lessons.nextLockedLesson(user.id);
+    if (!next) {
       return { kind: 'none' };
     }
 
-    const result = await this.lessons.createRequestSafe(user.id, lesson.number);
-    if (result.kind === 'existing') {
-      return { kind: 'pending', lesson };
+    const current = await this.lessons.lastUnlockedLesson(user.id);
+    if (current) {
+      const questions = await this.lessons.listQuestions(current.id);
+      if (questions.length > 0) {
+        return { kind: 'quiz', current, next };
+      }
     }
 
-    const label = formatLessonLabel(lesson.number, lesson.title);
+    const result = await this.lessons.createRequestSafe(user.id, next.number);
+    if (result.kind === 'existing') {
+      return { kind: 'pending', lesson: next };
+    }
+
+    const label = formatLessonLabel(next.number, next.title);
     await this.notifyOwners(
-      `Заявка на урок\n\nУченик: ${this.users.displayName(user)}\n${label}`,
+      `Заявка на урок\n\nУченик: ${this.users.displayName(user)}\n${label}\n(к текущему уроку нет вопросов — нужно подтверждение)`,
       [
         [
           { text: 'Отправить', callback_data: `unlock:ok:${result.request.id}` },
@@ -125,7 +134,7 @@ export class CourseService {
         ],
       ],
     );
-    return { kind: 'created', lesson };
+    return { kind: 'created', lesson: next };
   }
 
   private async ensureChannelInvite(user: User): Promise<string | undefined> {
