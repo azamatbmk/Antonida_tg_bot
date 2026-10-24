@@ -63,6 +63,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     if (readAppConfig(this.config).ownerIds.length === 0) {
       this.logger.warn('OWNER_TELEGRAM_IDS is empty — nobody can upload lessons');
     }
+    try {
+      await this.bot.api.setMyCommands([
+        { command: 'start', description: 'Меню курса' },
+        { command: 'cancel', description: 'Отменить текущее действие' },
+      ]);
+    } catch (error) {
+      this.logger.warn(`setMyCommands failed: ${String(error)}`);
+    }
     void this.bot.start({
       onStart: (info) => this.logger.log(`Bot @${info.username} started`),
     });
