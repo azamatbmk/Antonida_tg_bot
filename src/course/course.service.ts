@@ -3,6 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import { Lesson, User } from '@prisma/client';
 import { Bot } from 'grammy';
 import { TELEGRAM_BOT } from '../bot/bot.constants';
+import { studentKeyboard } from '../bot/keyboards';
+import { texts } from '../bot/texts';
 import { formatLessonLabel } from '../common/filename';
 import { readAppConfig } from '../config/app-config';
 import { LessonsService } from '../lessons/lessons.service';
@@ -52,9 +54,9 @@ export class CourseService {
     ];
 
     if (lesson) {
-      await this.lessons.unlock(updated.id, lesson.id);
       await this.bot.api.sendMessage(chatId, lines.filter(Boolean).join('\n'));
       await this.sendLesson(updated, lesson);
+      await this.sendStudentMenu(updated);
     } else {
       await this.bot.api.sendMessage(
         chatId,
@@ -78,6 +80,23 @@ export class CourseService {
     await this.lessons.unlock(user.id, lesson.id);
   }
 
+  async sendStudentMenu(user: User): Promise<void> {
+    const app = readAppConfig(this.config);
+    const unlocked = await this.lessons.unlockedLessons(user.id);
+    const next = await this.lessons.nextLockedLesson(user.id);
+    const text =
+      unlocked.length === 0
+        ? texts.noLessonsYet
+        : texts.studentHome(app.courseTitle);
+    await this.bot.api.sendMessage(Number(user.telegramId), text, {
+      reply_markup: studentKeyboard(
+        unlocked,
+        Boolean(next),
+        Boolean(app.channelId),
+      ),
+    });
+  }
+
   async sendLessonToWaitingStudents(lesson: Lesson): Promise<number> {
     const first = await this.lessons.firstLesson();
     if (!first || first.id !== lesson.id) {
@@ -91,6 +110,7 @@ export class CourseService {
           Number(student.telegramId),
           'Первый урок готов — отправил его выше.',
         );
+        await this.sendStudentMenu(student);
       } catch (error) {
         this.logger.warn(
           `Could not send first lesson to ${student.telegramId}: ${String(error)}`,
@@ -100,40 +120,19 @@ export class CourseService {
     return waiting.length;
   }
 
-  async requestNextLesson(user: User): Promise<
-    | { kind: 'none' }
-    | { kind: 'pending'; lesson: Lesson }
-    | { kind: 'created'; lesson: Lesson }
-  > {
+  /** Unlock and send the next locked lesson immediately. */
+  async deliverNextLesson(
+    user: User,
+  ): Promise<{ kind: 'none' } | { kind: 'sent'; lesson: Lesson }> {
     const next = await this.lessons.nextLockedLesson(user.id);
     if (!next) {
       return { kind: 'none' };
     }
-    return this.requestTeacherUnlock(user, next);
-  }
-
-  async requestTeacherUnlock(
-    user: User,
-    next: Lesson,
-  ): Promise<
-    { kind: 'pending'; lesson: Lesson } | { kind: 'created'; lesson: Lesson }
-  > {
-    const result = await this.lessons.createRequestSafe(user.id, next.number);
-    if (result.kind === 'existing') {
-      return { kind: 'pending', lesson: next };
+    if (await this.lessons.isUnlocked(user.id, next.id)) {
+      return { kind: 'none' };
     }
-
-    const label = formatLessonLabel(next.number, next.title);
-    await this.notifyOwners(
-      `Заявка на урок\n\nУченик: ${this.users.displayName(user)}\n${label}`,
-      [
-        [
-          { text: 'Отправить', callback_data: `unlock:ok:${result.request.id}` },
-          { text: 'Отклонить', callback_data: `unlock:no:${result.request.id}` },
-        ],
-      ],
-    );
-    return { kind: 'created', lesson: next };
+    await this.sendLesson(user, next);
+    return { kind: 'sent', lesson: next };
   }
 
   private async ensureChannelInvite(user: User): Promise<string | undefined> {

@@ -248,18 +248,19 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.answerCallbackQuery();
       return;
     }
-    const result = await this.course.requestNextLesson(user);
+    if (!takeRateLimit(`next:${user.telegramId}`, 10, 60_000)) {
+      await ctx.answerCallbackQuery({ text: 'Подождите немного' });
+      return;
+    }
+    const result = await this.course.deliverNextLesson(user);
     if (result.kind === 'none') {
       await ctx.answerCallbackQuery({ text: texts.allLessonsOpen });
+      await this.replyStudentHome(ctx, user.id);
       return;
     }
     const label = formatLessonLabel(result.lesson.number, result.lesson.title);
-    await ctx.answerCallbackQuery();
-    await ctx.reply(
-      result.kind === 'pending'
-        ? texts.nextAlreadyPending(label)
-        : texts.nextRequested(label),
-    );
+    await ctx.answerCallbackQuery({ text: texts.nextSent(label) });
+    await this.replyStudentHome(ctx, user.id);
   }
 
   private async onGetLesson(ctx: Context): Promise<void> {
@@ -276,6 +277,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     }
     await ctx.answerCallbackQuery();
     await this.course.sendLesson(user, lesson);
+    await this.replyStudentHome(ctx, user.id);
   }
 
   private async onChannelInvite(ctx: Context): Promise<void> {

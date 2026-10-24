@@ -16,13 +16,13 @@ export function studentKeyboard(
   hasChannel: boolean,
 ): InlineKeyboard {
   const keyboard = new InlineKeyboard();
+  if (hasNext) {
+    keyboard.text('Следующий урок', 'lesson:next').row();
+  }
   for (const lesson of unlocked) {
     keyboard
       .text(formatLessonLabel(lesson.number, lesson.title).slice(0, 64), `lesson:get:${lesson.number}`)
       .row();
-  }
-  if (hasNext) {
-    keyboard.text('Следующий урок', 'lesson:next').row();
   }
   if (hasChannel) {
     keyboard.text('Ссылка на канал', 'channel:invite').row();
@@ -31,9 +31,7 @@ export function studentKeyboard(
 }
 
 export function ownerKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('Уроки', 'admin:lessons')
-    .text('Заявки', 'admin:requests');
+  return new InlineKeyboard().text('Уроки', 'admin:lessons');
 }
 
 export function ownerLessonsKeyboard(lessons: Lesson[]): InlineKeyboard {
