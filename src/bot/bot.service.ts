@@ -7,7 +7,12 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Bot, Context } from 'grammy';
-import { answersMatch } from '../common/answer';
+import {
+  answersMatch,
+  MAX_LESSON_QUESTIONS,
+  MAX_QA_TEXT_LENGTH,
+  sanitizeQaText,
+} from '../common/answer';
 import {
   formatLessonLabel,
   isLessonNumber,
@@ -42,6 +47,7 @@ import {
   setPendingQuestions,
   setPendingQuiz,
   setPendingUpload,
+  takePendingQuizIfIndex,
 } from './pending-upload';
 import { texts } from './texts';
 
@@ -259,25 +265,32 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     if (result.kind === 'quiz') {
-      const questions = await this.lessons.listQuestions(result.current.id);
+      if (result.questions.length === 0) {
+        const fallback = await this.course.requestTeacherUnlock(user, result.next);
+        const label = formatLessonLabel(result.next.number, result.next.title);
+        await ctx.answerCallbackQuery();
+        await ctx.reply(
+          fallback.kind === 'pending'
+            ? texts.nextAlreadyPending(label)
+            : texts.nextRequested(label),
+        );
+        return;
+      }
       setPendingQuiz(user.telegramId, {
         currentLessonId: result.current.id,
         nextLessonId: result.next.id,
         nextLabel: formatLessonLabel(result.next.number, result.next.title),
         index: 0,
-        questions: questions.map((q) => ({
-          question: q.question,
-          answer: q.answer,
-        })),
+        questions: result.questions,
       });
       await ctx.answerCallbackQuery();
       const currentLabel = formatLessonLabel(
         result.current.number,
         result.current.title,
       );
-      await ctx.reply(texts.quizStart(currentLabel, questions.length));
+      await ctx.reply(texts.quizStart(currentLabel, result.questions.length));
       await ctx.reply(
-        texts.quizQuestion(1, questions.length, questions[0].question),
+        texts.quizQuestion(1, result.questions.length, result.questions[0].question),
       );
       return;
     }
@@ -604,11 +617,25 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    const clean = sanitizeQaText(text);
+    if (!clean) {
+      await ctx.reply(
+        `Текст пустой или длиннее ${MAX_QA_TEXT_LENGTH} символов. Напишите ещё раз.`,
+      );
+      return;
+    }
+
     if (session.step === 'question') {
+      if (session.items.length >= MAX_LESSON_QUESTIONS) {
+        await ctx.reply(
+          `Уже ${MAX_LESSON_QUESTIONS} вопросов — максимум. Напишите /done.`,
+        );
+        return;
+      }
       setPendingQuestions(telegramId, {
         ...session,
         step: 'answer',
-        draftQuestion: text,
+        draftQuestion: clean,
       });
       await ctx.reply(texts.ownerAskAnswer(session.items.length + 1));
       return;
@@ -625,13 +652,21 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const items = [...session.items, { question, answer: text }];
+    const items = [...session.items, { question, answer: clean }];
     setPendingQuestions(telegramId, {
       ...session,
       step: 'question',
       draftQuestion: undefined,
       items,
     });
+    if (items.length >= MAX_LESSON_QUESTIONS) {
+      await this.lessons.replaceQuestions(session.lessonId, items);
+      clearPendingQuestions(telegramId);
+      await ctx.reply(
+        texts.ownerQuestionsSaved(session.lessonLabel, items.length),
+      );
+      return;
+    }
     await ctx.reply(texts.ownerAskQuestion(items.length + 1));
   }
 
@@ -663,6 +698,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     user: { id: string; telegramId: string },
     text: string,
   ): Promise<void> {
+    if (!takeRateLimit(`quiz:${user.telegramId}`, 20, 60_000)) {
+      await ctx.reply('Слишком много попыток. Подождите минуту.');
+      return;
+    }
+
     const quiz = getPendingQuiz(user.telegramId);
     if (!quiz) {
       return;
@@ -674,31 +714,47 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     if (!answersMatch(current.answer, text)) {
+      if (!takeRateLimit(`quiz-wrong:${user.telegramId}`, 10, 60_000)) {
+        clearPendingQuiz(user.telegramId);
+        await ctx.reply(
+          'Слишком много неверных ответов. Опрос сброшен — нажмите «Следующий урок» позже.',
+        );
+        return;
+      }
       await ctx.reply(texts.quizWrong);
       return;
     }
 
-    const nextIndex = quiz.index + 1;
-    if (nextIndex < quiz.questions.length) {
-      setPendingQuiz(user.telegramId, { ...quiz, index: nextIndex });
+    const claimed = takePendingQuizIfIndex(user.telegramId, quiz.index);
+    if (!claimed) {
+      return;
+    }
+
+    const nextIndex = claimed.index + 1;
+    if (nextIndex < claimed.questions.length) {
+      setPendingQuiz(user.telegramId, { ...claimed, index: nextIndex });
       await ctx.reply(
         texts.quizQuestion(
           nextIndex + 1,
-          quiz.questions.length,
-          quiz.questions[nextIndex].question,
+          claimed.questions.length,
+          claimed.questions[nextIndex].question,
         ),
       );
       return;
     }
 
-    clearPendingQuiz(user.telegramId);
-    const lesson = await this.lessons.findById(quiz.nextLessonId);
+    const lesson = await this.lessons.findById(claimed.nextLessonId);
     const dbUser = await this.users.findById(user.id);
     if (!lesson || !dbUser) {
       await ctx.reply('Следующий урок не найден. Напишите преподавателю.');
       return;
     }
-    await ctx.reply(texts.quizDone(quiz.nextLabel));
+    if (await this.lessons.isUnlocked(dbUser.id, lesson.id)) {
+      await ctx.reply('Этот урок уже открыт.');
+      await this.replyStudentHome(ctx, user.id);
+      return;
+    }
+    await ctx.reply(texts.quizDone(claimed.nextLabel));
     await this.course.sendLesson(dbUser, lesson);
     await this.replyStudentHome(ctx, user.id);
   }

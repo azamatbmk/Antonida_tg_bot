@@ -94,6 +94,19 @@ export function clearPendingQuiz(telegramId: string): void {
   pendingQuiz.delete(telegramId);
 }
 
+/** Atomically take quiz only if index still matches (prevents double unlock). */
+export function takePendingQuizIfIndex(
+  telegramId: string,
+  index: number,
+): PendingQuiz | null {
+  const value = alive(pendingQuiz, telegramId);
+  if (!value || value.index !== index) {
+    return null;
+  }
+  pendingQuiz.delete(telegramId);
+  return value;
+}
+
 export function clearAllOwnerSessions(telegramId: string): void {
   clearPendingUpload(telegramId);
   clearPendingQuestions(telegramId);

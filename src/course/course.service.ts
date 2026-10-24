@@ -102,7 +102,12 @@ export class CourseService {
 
   async requestNextLesson(user: User): Promise<
     | { kind: 'none' }
-    | { kind: 'quiz'; current: Lesson; next: Lesson }
+    | {
+        kind: 'quiz';
+        current: Lesson;
+        next: Lesson;
+        questions: { question: string; answer: string }[];
+      }
     | { kind: 'pending'; lesson: Lesson }
     | { kind: 'created'; lesson: Lesson }
   > {
@@ -115,10 +120,27 @@ export class CourseService {
     if (current) {
       const questions = await this.lessons.listQuestions(current.id);
       if (questions.length > 0) {
-        return { kind: 'quiz', current, next };
+        return {
+          kind: 'quiz',
+          current,
+          next,
+          questions: questions.map((q) => ({
+            question: q.question,
+            answer: q.answer,
+          })),
+        };
       }
     }
 
+    return this.requestTeacherUnlock(user, next);
+  }
+
+  async requestTeacherUnlock(
+    user: User,
+    next: Lesson,
+  ): Promise<
+    { kind: 'pending'; lesson: Lesson } | { kind: 'created'; lesson: Lesson }
+  > {
     const result = await this.lessons.createRequestSafe(user.id, next.number);
     if (result.kind === 'existing') {
       return { kind: 'pending', lesson: next };
