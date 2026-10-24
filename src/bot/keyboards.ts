@@ -54,6 +54,13 @@ export function confirmDeleteLessonKeyboard(number: string): InlineKeyboard {
     .text('Отмена', 'admin:lessons');
 }
 
+export function suggestLessonNumberKeyboard(number: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(`Номер ${number}`, `upload:num:${number}`)
+    .row()
+    .text('Отмена', 'upload:cancel');
+}
+
 export function backHomeKeyboard(): InlineKeyboard {
   return new InlineKeyboard().text('В меню', 'nav:home');
 }

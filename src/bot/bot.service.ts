@@ -27,7 +27,14 @@ import {
   ownerKeyboard,
   ownerLessonsKeyboard,
   studentKeyboard,
+  suggestLessonNumberKeyboard,
 } from './keyboards';
+import {
+  clearPendingUpload,
+  getPendingUpload,
+  nextLessonNumber,
+  setPendingUpload,
+} from './pending-upload';
 import { texts } from './texts';
 
 @Injectable()
@@ -69,6 +76,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.command('start', (ctx) => this.showHome(ctx));
     this.bot.command('admin', (ctx) => this.showOwnerHome(ctx));
     this.bot.command('reset_invite', (ctx) => this.onResetInvite(ctx));
+    this.bot.command('cancel', (ctx) => this.onCancelUpload(ctx));
 
     this.bot.callbackQuery('nav:home', async (ctx) => {
       await ctx.answerCallbackQuery();
@@ -85,9 +93,12 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.callbackQuery(/^lesson:delok:(\d+(?:\.\d+)*)$/, (ctx) => this.onDeleteLessonConfirm(ctx));
     this.bot.callbackQuery(/^unlock:ok:(.+)$/, (ctx) => this.onUnlock(ctx, 'approved'));
     this.bot.callbackQuery(/^unlock:no:(.+)$/, (ctx) => this.onUnlock(ctx, 'rejected'));
+    this.bot.callbackQuery(/^upload:num:(\d+(?:\.\d+)*)$/, (ctx) => this.onUploadPickNumber(ctx));
+    this.bot.callbackQuery('upload:cancel', (ctx) => this.onCancelUpload(ctx));
 
     this.bot.on('message:document', (ctx) => this.onOwnerFile(ctx));
     this.bot.on('message:video', (ctx) => this.onOwnerFile(ctx));
+    this.bot.on('message:text', (ctx) => this.onOwnerText(ctx));
   }
 
   private async showHome(ctx: Context): Promise<void> {
@@ -445,26 +456,150 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    const fileName =
+      document?.file_name ?? `video-${Date.now()}.mp4`;
+    const mimeType = document?.mime_type ?? video?.mime_type;
     const parsed =
       parseLessonName(ctx.message?.caption ?? '') ??
       parseLessonName(document?.file_name ?? '');
-    if (!parsed) {
-      await ctx.reply(texts.ownerNeedName);
+
+    if (parsed) {
+      await this.saveOwnerLesson(ctx, {
+        number: parsed.number,
+        title: parsed.title,
+        fileId,
+        fileName,
+        mimeType,
+      });
       return;
     }
 
-    const existing = await this.lessons.findByNumber(parsed.number);
-    const lesson = await this.lessons.saveFile({
+    const lessons = await this.lessons.list();
+    const suggested = nextLessonNumber(lessons.map((lesson) => lesson.number));
+    setPendingUpload(user.telegramId, { fileId, fileName, mimeType });
+    await ctx.reply(texts.ownerNeedName(suggested), {
+      reply_markup: suggestLessonNumberKeyboard(suggested),
+    });
+  }
+
+  private async onOwnerText(ctx: Context): Promise<void> {
+    if (ctx.chat?.type !== 'private' || ctx.message?.text?.startsWith('/')) {
+      return;
+    }
+    const user = await this.actor(ctx);
+    if (!user || !this.course.isOwner(user.telegramId)) {
+      return;
+    }
+
+    const pending = getPendingUpload(user.telegramId);
+    if (!pending) {
+      return;
+    }
+
+    const text = ctx.message?.text?.trim() ?? '';
+    if (!text) {
+      return;
+    }
+
+    if (pending.number) {
+      const title = text.replace(/\s+/g, ' ').trim();
+      if (title.length === 0) {
+        await ctx.reply(texts.ownerAskTitle(pending.number));
+        return;
+      }
+      clearPendingUpload(user.telegramId);
+      await this.saveOwnerLesson(ctx, {
+        number: pending.number,
+        title,
+        fileId: pending.fileId,
+        fileName: pending.fileName,
+        mimeType: pending.mimeType,
+      });
+      return;
+    }
+
+    const parsed = parseLessonName(text);
+    if (!parsed) {
+      const lessons = await this.lessons.list();
+      const suggested = nextLessonNumber(lessons.map((lesson) => lesson.number));
+      await ctx.reply(texts.ownerNeedName(suggested), {
+        reply_markup: suggestLessonNumberKeyboard(suggested),
+      });
+      return;
+    }
+
+    clearPendingUpload(user.telegramId);
+    await this.saveOwnerLesson(ctx, {
       number: parsed.number,
       title: parsed.title,
-      fileId,
-      fileName: document?.file_name ?? formatLessonLabel(parsed.number, parsed.title),
-      mimeType: document?.mime_type ?? video?.mime_type,
+      fileId: pending.fileId,
+      fileName: pending.fileName,
+      mimeType: pending.mimeType,
     });
-    await ctx.reply(texts.ownerSaved(formatLessonLabel(lesson.number, lesson.title), Boolean(existing)));
+  }
+
+  private async onUploadPickNumber(ctx: Context): Promise<void> {
+    const user = await this.actor(ctx);
+    if (!user || !this.ensureOwner(ctx, user.telegramId)) {
+      return;
+    }
+    const number = ctx.match?.[1];
+    const pending = getPendingUpload(user.telegramId);
+    if (!number || !isLessonNumber(number) || !pending) {
+      await ctx.answerCallbackQuery({
+        text: pending ? 'Неверный номер' : texts.ownerUploadExpired,
+      });
+      return;
+    }
+    setPendingUpload(user.telegramId, { ...pending, number });
+    await ctx.answerCallbackQuery();
+    await ctx.reply(texts.ownerAskTitle(number));
+  }
+
+  private async onCancelUpload(ctx: Context): Promise<void> {
+    const user = await this.actor(ctx);
+    if (!user || !this.course.isOwner(user.telegramId)) {
+      if (ctx.callbackQuery) {
+        await ctx.answerCallbackQuery();
+      }
+      return;
+    }
+    clearPendingUpload(user.telegramId);
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: 'Отменено' });
+    }
+    await ctx.reply(texts.ownerUploadCancelled);
+  }
+
+  private async saveOwnerLesson(
+    ctx: Context,
+    input: {
+      number: string;
+      title: string;
+      fileId: string;
+      fileName: string;
+      mimeType?: string;
+    },
+  ): Promise<void> {
+    const existing = await this.lessons.findByNumber(input.number);
+    const lesson = await this.lessons.saveFile({
+      number: input.number,
+      title: input.title,
+      fileId: input.fileId,
+      fileName: input.fileName,
+      mimeType: input.mimeType,
+    });
+    await ctx.reply(
+      texts.ownerSaved(
+        formatLessonLabel(lesson.number, lesson.title),
+        Boolean(existing),
+      ),
+    );
     const delivered = await this.course.sendLessonToWaitingStudents(lesson);
     if (delivered > 0) {
-      await ctx.reply(`Первый урок ушёл ${delivered} ученикам, которые уже оплатили.`);
+      await ctx.reply(
+        `Первый урок ушёл ${delivered} ученикам, которые уже оплатили.`,
+      );
     }
   }
 
