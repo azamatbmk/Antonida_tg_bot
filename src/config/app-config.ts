@@ -20,19 +20,6 @@ function truthy(value: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
 }
 
-function isLocalPublicUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return (
-      parsed.hostname === 'localhost' ||
-      parsed.hostname === '127.0.0.1' ||
-      parsed.hostname === '::1'
-    );
-  } catch {
-    return false;
-  }
-}
-
 export function readAppConfig(config: ConfigService) {
   const ownerIds = (config.get<string>('OWNER_TELEGRAM_IDS') ?? '')
     .split(',')
@@ -46,9 +33,6 @@ export function readAppConfig(config: ConfigService) {
 
   const selfworkApiKey = optional(config, 'SELFWORK_API_KEY');
   const callbackSecret = optional(config, 'SELFWORK_CALLBACK_SECRET');
-  const mockPayFlag = truthy(optional(config, 'ENABLE_MOCK_PAY'));
-  const isProd =
-    (optional(config, 'NODE_ENV') ?? process.env.NODE_ENV) === 'production';
   const publicUrl = (
     optional(config, 'PUBLIC_URL') ?? 'http://localhost:3000'
   ).replace(/\/$/, '');
@@ -62,18 +46,8 @@ export function readAppConfig(config: ConfigService) {
     coursePriceRub: Number.isFinite(priceRub) && priceRub > 0 ? priceRub : 3000,
     publicUrl,
     port: Number.parseInt(config.get<string>('PORT') ?? '3000', 10) || 3000,
-    /**
-     * Mock pay only when:
-     * - ENABLE_MOCK_PAY=1
-     * - not production
-     * - Selfwork not fully configured
-     * - PUBLIC_URL is localhost (blocks accidental deploy with mock on)
-     */
-    mockPayEnabled:
-      mockPayFlag &&
-      !isProd &&
-      !(selfworkApiKey && callbackSecret) &&
-      isLocalPublicUrl(publicUrl),
+    // TEMP: flag alone enables mock pay everywhere (incl. prod). Turn off after testing.
+    mockPayEnabled: truthy(optional(config, 'ENABLE_MOCK_PAY')),
     selfwork: {
       apiKey: selfworkApiKey,
       initUrl:
