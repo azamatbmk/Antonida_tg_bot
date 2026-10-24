@@ -102,12 +102,6 @@ export class CourseService {
 
   async requestNextLesson(user: User): Promise<
     | { kind: 'none' }
-    | {
-        kind: 'quiz';
-        current: Lesson;
-        next: Lesson;
-        questions: { question: string; answer: string }[];
-      }
     | { kind: 'pending'; lesson: Lesson }
     | { kind: 'created'; lesson: Lesson }
   > {
@@ -115,23 +109,6 @@ export class CourseService {
     if (!next) {
       return { kind: 'none' };
     }
-
-    const current = await this.lessons.lastUnlockedLesson(user.id);
-    if (current) {
-      const questions = await this.lessons.listQuestions(current.id);
-      if (questions.length > 0) {
-        return {
-          kind: 'quiz',
-          current,
-          next,
-          questions: questions.map((q) => ({
-            question: q.question,
-            answer: q.answer,
-          })),
-        };
-      }
-    }
-
     return this.requestTeacherUnlock(user, next);
   }
 
@@ -148,7 +125,7 @@ export class CourseService {
 
     const label = formatLessonLabel(next.number, next.title);
     await this.notifyOwners(
-      `Заявка на урок\n\nУченик: ${this.users.displayName(user)}\n${label}\n(к текущему уроку нет вопросов — нужно подтверждение)`,
+      `Заявка на урок\n\nУченик: ${this.users.displayName(user)}\n${label}`,
       [
         [
           { text: 'Отправить', callback_data: `unlock:ok:${result.request.id}` },
